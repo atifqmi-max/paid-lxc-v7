@@ -1,100 +1,193 @@
-# PAID_LXC_v7 Discord Bot
+# PAID LXC v7 — Discord VPS Manager Bot
 
-A Discord bot that lets admins create and manage LXC/LXD containers ("VPS") for
-users directly from Discord — creation, resizing, suspension, snapshots, port
-forwarding, multi-node support, and an admin panel.
+Discord bot jo LXC/LXD containers ko "VPS" ki tarah manage karta hai —
+create, resize, suspend, snapshot, port-forward, multi-node support, aur
+poora admin panel — sab kuch Discord commands se.
 
-> ⚠️ **Security notice:** the copy of `PAID_LXC_v7_bot.py` you have contains a
-> **hardcoded Discord bot token** as a fallback default (line 19). Treat that
-> token as compromised — go to the
-> [Discord Developer Portal](https://discord.com/developers/applications),
-> open your bot's **Bot** tab, and click **Reset Token** immediately. Only put
-> the *new* token in your `.env` file, and never push `.env` to GitHub.
+> ⚠️ **Pehle ye kar lo:** is file ke andar (`PAID_LXC_v7_bot.py` line 19) ek
+> **hardcoded Discord token** default value ke tor par mila tha. Discord
+> Developer Portal → Bot tab → **Reset Token** kar ke naya token le lo, aur
+> sirf wo naya token `.env` mein daalo. `.env` ko kabhi GitHub pe push mat
+> karna.
 
-## Requirements
+---
 
-- **Python 3.10+**
-- **Linux host with LXD/LXC installed and initialized** (the bot shells out
-  to the `lxc` command via `subprocess`, so it must be runnable on the same
-  machine as the bot, with permission to manage containers — typically means
-  running the bot as root or a user in the `lxd` group)
-- A Discord bot application + token (with **Server Members** and **Message
-  Content** privileged intents enabled in the Developer Portal, since the bot
-  uses `commands.Bot` with prefix commands)
+## 📋 Requirements
 
-## 1. Get the code
+- Ubuntu/Debian VPS ya server (root access)
+- Python 3.10+
+- LXD/LXC installed & initialized
+- Discord Bot Token (Server Members Intent + Message Content Intent ON)
+
+---
+
+## 📦 Installation
 
 ```bash
+# 1) Repo clone karo
 git clone https://github.com/atifqmi-max/paid-lxc-v7.git
 cd paid-lxc-v7
-```
 
-(Or just place `PAID_LXC_v7_bot.py` in its own folder.)
-
-## 2. Install Python dependencies
-
-```bash
+# 2) Python virtual environment banao
 python3 -m venv venv
-source venv/bin/activate       # Windows: venv\Scripts\activate
+source venv/bin/activate
+
+# 3) Dependencies install karo
 pip install -r requirements.txt
 ```
 
-`requirements.txt`:
+**requirements.txt:**
 ```
 discord.py>=2.3.2
 requests>=2.31.0
 ```
+(Baaki sab — `sqlite3`, `subprocess`, `json`, `threading` waghera — Python ke
+sath already aata hai, alag se install nahi karna.)
 
-Everything else the bot imports (`sqlite3`, `subprocess`, `shlex`, `json`,
-`threading`, etc.) is part of the Python standard library — nothing extra to
-install for those.
+---
 
-## 3. Install LXD/LXC on the host
+## 🖥️ LXD/LXC Setup
 
 ```bash
 sudo snap install lxd
-sudo lxd init          # accept defaults, or configure storage pool/network
+sudo lxd init
 ```
 
-Whatever storage pool name you set during `lxd init` should match
-`DEFAULT_STORAGE_POOL` in your `.env`.
+`lxd init` mein jo storage pool name doge, wahi `.env` mein
+`DEFAULT_STORAGE_POOL` mein daalna hai.
 
-## 4. Configure environment variables
+---
 
-Copy the provided `.env` template into your project folder and fill in real
-values (see the file for what each variable does):
+## ⚙️ Configuration (.env)
 
-- `DISCORD_TOKEN` – your **new** bot token (see security notice above)
-- `MAIN_ADMIN_ID` / `VPS_USER_ROLE_ID` – right-click your Discord profile /
-  the role → **Copy ID** (Developer Mode must be enabled in Discord settings)
-- `YOUR_SERVER_IP` – the IP users will connect to their containers on
+Root folder mein `.env` file banao (already di gayi hai) aur values fill
+karo:
 
-The bot reads these with `os.getenv(...)`, so you need to actually load them
-into the process environment. Two easy options:
+```env
+DISCORD_TOKEN=your_new_bot_token_here
+BOT_NAME=Night Cloud Free - Nodes 1
+PREFIX=.
+YOUR_SERVER_IP=your.server.ip
+MAIN_ADMIN_ID=your_discord_user_id
+VPS_USER_ROLE_ID=your_role_id
+DEFAULT_STORAGE_POOL=default
+BOT_VERSION=1.0
+BOT_DEVELOPER=Admin
+```
 
-**Option A — export before running:**
+ID's nikalne ke liye Discord Settings → Advanced → **Developer Mode** ON
+karo, phir apne profile / role pe right-click → **Copy ID**.
+
+Bot `os.getenv()` se ye values read karta hai, isliye `.env` ko process mein
+load karna padega — is ke liye neeche systemd method use karo (wo automatic
+load kar deta hai `EnvironmentFile` se), ya manually:
+
 ```bash
+export $(grep -v '^#' .env | xargs)
+```
+
+---
+
+## ▶️ Manual Run (testing ke liye)
+
+```bash
+source venv/bin/activate
 export $(grep -v '^#' .env | xargs)
 python3 PAID_LXC_v7_bot.py
 ```
 
-**Option B — use a process manager that loads `.env` automatically**, e.g.
-`pm2`, `systemd` with `EnvironmentFile=`, or Docker's `--env-file .env`.
+Terminal band karte hi bot bhi band ho jayega — 24/7 ke liye neeche wala
+systemd method use karo.
 
-## 5. Run the bot
+---
+
+## 🔁 24/7 Run — systemd Service (Recommended)
+
+Ye wahi tareeqa hai jo pehle use hota tha. `nohup` / `screen` / `pm2` waghera
+ke bajaye **systemd** zyada reliable hai — server reboot hone pe bhi bot
+khud start ho jata hai, aur crash hone pe khud restart hota hai.
+
+### 1) Service file banao
 
 ```bash
-python3 PAID_LXC_v7_bot.py
+sudo nano /etc/systemd/system/paidlxc.service
 ```
 
-On first run it creates `vps.db` (SQLite) and `bot.log` in the working
-directory.
+Ye paste karo (paths apne actual clone location ke hisaab se badlo):
 
-## Notes
+```ini
+[Unit]
+Description=PAID LXC v7 Discord Bot
+After=network.target
 
-- The bot must run with permission to execute `lxc` commands (root, or a user
-  in the `lxd` group) since it manages containers via `subprocess`.
-- Because this bot can create containers and execute arbitrary commands
-  inside them via `.exec`, restrict `MAIN_ADMIN_ID` / admin list carefully —
-  anyone with admin access effectively has root on your host's containers.
-- Keep `.env` and `vps.db` out of version control (add them to `.gitignore`).
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/paid-lxc-v7
+EnvironmentFile=/root/paid-lxc-v7/.env
+ExecStart=/root/paid-lxc-v7/venv/bin/python3 /root/paid-lxc-v7/PAID_LXC_v7_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> `WorkingDirectory`, `EnvironmentFile`, aur `ExecStart` ke paths apne actual
+> folder ke mutabiq set karo (`pwd` chala kar current path check kar sakte
+> ho).
+
+### 2) Service enable + start karo
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable paidlxc.service
+sudo systemctl start paidlxc.service
+```
+
+### 3) Status/logs check karo
+
+```bash
+sudo systemctl status paidlxc.service      # running hai ya nahi
+sudo journalctl -u paidlxc.service -f      # live logs
+```
+
+### 4) Common commands
+
+```bash
+sudo systemctl restart paidlxc.service     # bot restart
+sudo systemctl stop paidlxc.service        # bot stop
+sudo systemctl disable paidlxc.service     # auto-start band karna
+```
+
+**Agar `systemctl status` mein "failed" ya "activating (auto-restart)" dikhe:**
+- `sudo journalctl -u paidlxc.service -n 50 --no-pager` se exact error dekho
+- Zyada tar wajah: galat path in `ExecStart`/`WorkingDirectory`, ya `.env`
+  mein missing/galat `DISCORD_TOKEN`
+- `venv/bin/python3` ka path double-check karo: `ls venv/bin/python3`
+
+---
+
+## 🔄 Bot Update Karna
+
+Jab bhi repo mein naya code aaye:
+
+```bash
+cd paid-lxc-v7
+git pull
+sudo systemctl restart paidlxc.service
+```
+
+Sirf jo file change hui ho wahi update karni ho to `git pull` khud detect
+kar leta hai — sirf changed files overwrite hoti hain, baaki (jaise `.env`,
+`vps.db`, `bot.log`) untouched rehti hain (bashart ke wo `.gitignore` mein
+hon).
+
+---
+
+## ⚠️ Security Notes
+
+- `.env` aur `vps.db` ko kabhi git commit ya public repo mein mat daalna
+- Sirf trusted logon ko `MAIN_ADMIN_ID` / admin list mein rakho — `.exec`
+  command se admin ke paas container ke andar root-level access hai
+- Compromised token turant Developer Portal se reset karo
