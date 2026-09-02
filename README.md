@@ -93,7 +93,7 @@ export $(grep -v '^#' .env | xargs)
 ```bash
 source venv/bin/activate
 export $(grep -v '^#' .env | xargs)
-python3 PAID_LXC_v7_bot.py
+python3 lxc-bot-v7.py
 ```
 
 Terminal band karte hi bot bhi band ho jayega — 24/7 ke liye neeche wala
