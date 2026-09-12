@@ -20,6 +20,9 @@ custom **Green & Stone** theme.
 
 - 🖥️ **Full VPS lifecycle** — create, start, stop, reinstall, resize, clone, snapshot, and delete LXC containers straight from Discord.
 - 🎛️ **One-tap control panel** — `+manage <vps-id>` opens a specific VPS's buttons instantly (no dropdown hunting).
+- ⏳ **Timed VPS rentals** — create a VPS with a duration in days; it auto-suspends when time's up, and admins can `+extend` it.
+- ⛏️ **Automatic crypto-mining / abuse detection** — sustained high CPU+RAM+Disk usage auto-suspends the VPS and DMs both the owner and the admin.
+- 📋 **`+all-vm`** — one compact list of every VPS on the bot: owner, container ID, and RAM.
 - 🔌 **Port forwarding** built on native LXD proxy devices — no manual iptables.
 - 👑 **Admin tools** — quotas, suspensions, whitelisting, multi-node support, resource monitoring.
 - 🤝 **VPS sharing** — owners can grant/revoke access to their VPS for teammates.
@@ -223,12 +226,54 @@ Default prefix is `+` (change via `PREFIX` in `.env`).
 | `+myvps` | List your own VPS |
 | `+manage` | Browse and control all your VPS |
 | `+manage <vps-id>` | Jump straight into one VPS's control panel (Start / Stop / Reinstall / SSH / Stats) |
-| `+create <ram> <cpu> <disk> @user` | *(Admin)* create a new VPS for a user |
+| `+create <ram> <cpu> <disk> @user [duration_days]` | *(Admin)* create a new VPS for a user, optionally with a rental duration |
+| `+extend <container> <days>` | *(Admin)* add days to a VPS's duration — unsuspends it if it was suspended |
+| `+all-vm` | *(Admin)* compact one-line-per-VPS list: owner, container ID, RAM |
+| `+suspend-vps <container> [reason]` | *(Admin)* suspend a VPS |
+| `+unsuspend-vps <container>` | *(Admin)* lift a suspension |
 | `+ports` | Manage your port forwards |
 | `+node list` | *(Admin)* list LXD nodes |
 
 > 💡 When a VPS is created, the owner gets a DM with their **VPS ID** and the
 > exact `+manage <id>` command to use — the number matches what's shown there.
+
+---
+
+### ⏳ Timed VPS rentals & extending
+
+Add a number of days to `+create` to make a VPS expire automatically:
+
+```
++create 4 2 40 @someuser 30
+```
+
+This creates a 4GB/2-core/40GB VPS that **auto-suspends after 30 days**. The
+owner gets a DM when it's created (showing the expiry date) and another DM
+the moment it auto-suspends. To give someone more time — and automatically
+unsuspend + restart their VPS if it already expired:
+
+```
++extend stonenodes-vps-123456789-1 15
+```
+
+Leave `duration_days` off `+create` entirely for a VPS with no expiry.
+
+### ⛏️ Automatic crypto-mining / resource-abuse detection
+
+Every few minutes, the bot checks all running (non-whitelisted) VPS. If a
+VPS's **CPU, RAM, and Disk usage are all simultaneously very high** for
+several checks in a row — the classic signature of a crypto-miner running
+flat out — the bot automatically:
+
+1. Stops the container and marks it suspended.
+2. DMs the owner explaining exactly why (with the measured CPU/RAM/Disk %).
+3. DMs the configured `MAIN_ADMIN_ID` so an admin can review it.
+
+A normal one-off spike (compiling something, a game server update, etc.)
+won't trigger this — it only fires on **sustained** high usage across **all
+three** metrics at once. An admin can reverse a false positive with
+`+unsuspend-vps <container>`, or `+whitelist-vps <container> add` to exempt
+that VPS from monitoring entirely.
 
 ---
 
@@ -352,6 +397,17 @@ If the bot runs as a different user than the one you tested with, make sure
 - 🎯 Added direct VPS management — `+manage <vps-id>` opens that VPS's panel
   immediately, and the creation DM now tells owners their ID and the exact
   command to use.
+- ⏳ Added **timed VPS rentals** — `+create` takes an optional
+  `duration_days`, auto-suspending the VPS when it runs out — and a new
+  `+extend <container> <days>` admin command to add time back (and
+  auto-unsuspend).
+- ⛏️ Added **automatic crypto-mining/abuse detection** — a background check
+  auto-suspends any VPS with sustained high CPU + RAM + Disk usage all at
+  once, DMs the owner with the reason, and DMs the admin for review.
+- 📋 Added **`+all-vm`** — a compact, working, one-line-per-VPS list of every
+  VPS on the bot (owner, container ID, RAM). Also fixed the existing
+  `+list-all` command, which was silently building its per-VPS breakdown but
+  never actually sending it.
 - 🧹 Removed leftover branding from earlier resellers of this codebase
   ("Zycron", "Powered by Your Bot") that was still hardcoded in a few embeds.
 - 🔐 **Security fix** — the original file had a real Discord bot token, admin
