@@ -1,9 +1,9 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import asyncio
 import subprocess
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import shlex
 import logging
 import shutil
@@ -14,6 +14,7 @@ import time
 import sqlite3
 import random
 import requests
+import re
 from dotenv import load_dotenv
 
 # Load variables from a .env file next to this script (if present). This lets
@@ -393,6 +394,21 @@ admin_data = {'admins': get_admins()}
 CPU_THRESHOLD = int(get_setting('cpu_threshold', 90))
 RAM_THRESHOLD = int(get_setting('ram_threshold', 90))
 
+# --- Suspicious-activity (e.g. crypto-mining) auto-suspend settings ---
+# A VPS gets auto-suspended if CPU, RAM, AND Disk usage are ALL at/above
+# these thresholds for MINING_CONSECUTIVE_CHECKS checks in a row (spaced
+# MINING_CHECK_MINUTES apart), so a single short spike (a big build, a game
+# server update, etc.) never triggers a false suspension. Adjust the numbers
+# below directly if you need to tune sensitivity.
+MINING_CPU_THRESHOLD = 95
+MINING_RAM_THRESHOLD = 85
+MINING_DISK_THRESHOLD = 85
+MINING_CHECK_MINUTES = 5
+MINING_CONSECUTIVE_CHECKS = 3
+# Tracks how many checks in a row each container has been over all three
+# thresholds. Reset to 0 the moment any metric drops back down.
+_high_usage_streak: Dict[str, int] = {}
+
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
@@ -409,6 +425,16 @@ def truncate_text(text, max_length=1024):
     if len(text) <= max_length:
         return text
     return text[:max_length-3] + "..."
+
+def parse_disk_percentage(disk_str: str) -> float:
+    """Extracts the numeric percentage out of a disk string like
+    '5.2G/20G (26%)'. Returns 0.0 if it can't be parsed."""
+    if not disk_str:
+        return 0.0
+    match = re.search(r'\((\d+(?:\.\d+)?)%\)', disk_str)
+    if match:
+        return float(match.group(1))
+    return 0.0
 
 # Embed creation functions
 def create_embed(title, description="", color=COLOR_STONE):
@@ -899,6 +925,8 @@ DEFAULT_STORAGE_POOL = os.getenv('DEFAULT_STORAGE_POOL', get_default_storage_poo
 async def on_ready():
     logger.info(f'{bot.user} has connected to Discord!')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=f"{BOT_NAME} VPS Manager"))
+    if not auto_security_monitor.is_running():
+        auto_security_monitor.start()
     logger.info(f"{BOT_NAME} Bot is ready!")
 
 @bot.event
@@ -1082,13 +1110,14 @@ async def lxc_list(ctx, node_id: int = 1):
         await ctx.send(embed=create_error_embed("Error", str(e)))
 
 class NodeSelectView(discord.ui.View):
-    def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx):
+    def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx, duration: int = 0):
         super().__init__(timeout=300)
         self.ram = ram
         self.cpu = cpu
         self.disk = disk
         self.user = user
         self.ctx = ctx
+        self.duration = duration
         nodes = get_nodes()
         options = []
         for n in nodes:
@@ -1109,11 +1138,11 @@ class NodeSelectView(discord.ui.View):
         node_id = int(self.select.values[0])
         self.select.disabled = True
         await interaction.response.edit_message(view=self)
-        os_view = OSSelectView(self.ram, self.cpu, self.disk, self.user, self.ctx, node_id)
+        os_view = OSSelectView(self.ram, self.cpu, self.disk, self.user, self.ctx, node_id, self.duration)
         await interaction.followup.send(embed=create_info_embed("Select OS", "Choose the OS for the VPS."), view=os_view)
 
 class OSSelectView(discord.ui.View):
-    def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx, node_id: int):
+    def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx, node_id: int, duration: int = 0):
         super().__init__(timeout=300)
         self.ram = ram
         self.cpu = cpu
@@ -1121,6 +1150,7 @@ class OSSelectView(discord.ui.View):
         self.user = user
         self.ctx = ctx
         self.node_id = node_id
+        self.duration = duration
         self.select = discord.ui.Select(
             placeholder="Select an OS for the VPS",
             options=[discord.SelectOption(label=o["label"], value=o["value"]) for o in OS_OPTIONS]
@@ -1152,6 +1182,9 @@ class OSSelectView(discord.ui.View):
             await apply_internal_permissions(container_name, self.node_id)
             await recreate_port_forwards(container_name)
             config_str = f"{self.ram}GB RAM / {self.cpu} CPU / {self.disk}GB Disk"
+            expires_at = None
+            if self.duration and self.duration > 0:
+                expires_at = (datetime.now() + timedelta(days=self.duration)).isoformat()
             vps_info = {
                 "container_name": container_name,
                 "node_id": self.node_id,
@@ -1166,6 +1199,8 @@ class OSSelectView(discord.ui.View):
                 "suspension_history": [],
                 "created_at": datetime.now().isoformat(),
                 "shared_with": [],
+                "duration_days": self.duration if self.duration and self.duration > 0 else None,
+                "expires_at": expires_at,
                 "id": None
             }
             vps_data[user_id].append(vps_info)
@@ -1184,13 +1219,19 @@ class OSSelectView(discord.ui.View):
             add_field(success_embed, "Node", get_node(self.node_id)['name'], True)
             add_field(success_embed, "Resources", f"**RAM:** {self.ram}GB\n**CPU:** {self.cpu} Cores\n**Storage:** {self.disk}GB", False)
             add_field(success_embed, "OS", os_version, True)
+            if expires_at:
+                add_field(success_embed, "Duration", f"{self.duration} day(s) — expires **{datetime.fromisoformat(expires_at).strftime('%Y-%m-%d %H:%M')}**\nUse `{PREFIX}extend {container_name} <days>` to extend it.", False)
+            else:
+                add_field(success_embed, "Duration", "Unlimited (no auto-suspend)", False)
             add_field(success_embed, "Features", "Nesting, Privileged, FUSE, Kernel Modules (Docker Ready), Unprivileged Ports from 0", False)
             add_field(success_embed, "Disk Note", "Run `sudo resize2fs /` inside VPS if needed to expand filesystem.", False)
             await interaction.followup.send(embed=success_embed)
             dm_embed = create_success_embed("VPS Created!", f"Your VPS has been successfully deployed by an admin!")
             add_field(dm_embed, "VPS Details", f"**VPS ID:** #{vps_count}\n**Container Name:** `{container_name}`\n**Configuration:** {config_str}\n**Status:** Running\n**OS:** {os_version}\n**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", False)
+            if expires_at:
+                add_field(dm_embed, "Duration", f"This VPS is valid for **{self.duration} day(s)** and will auto-suspend on **{datetime.fromisoformat(expires_at).strftime('%Y-%m-%d %H:%M')}** unless an admin extends it.", False)
             add_field(dm_embed, "Management", f"• Your VPS ID is **#{vps_count}** — use `{PREFIX}manage {vps_count}` to manage this VPS directly\n• Use `{PREFIX}manage` to browse all of your VPS\n• Contact admin for upgrades or issues", False)
-            add_field(dm_embed, "Important Notes", "• Full root access via SSH\n• Docker-ready with nesting and privileged mode\n• Back up your data regularly", False)
+            add_field(dm_embed, "Important Notes", "• Full root access via SSH\n• Docker-ready with nesting and privileged mode\n• Back up your data regularly\n• Crypto-mining or other resource-abuse is not permitted and is auto-detected", False)
             try:
                 await self.user.send(embed=dm_embed)
             except discord.Forbidden:
@@ -1201,12 +1242,16 @@ class OSSelectView(discord.ui.View):
 
 @bot.command(name='create')
 @is_admin()
-async def create_vps(ctx, ram: int, cpu: int, disk: int, user: discord.Member):
+async def create_vps(ctx, ram: int, cpu: int, disk: int, user: discord.Member, duration: int = 0):
     if ram <= 0 or cpu <= 0 or disk <= 0:
         await ctx.send(embed=create_error_embed("Invalid Specs", "RAM, CPU, and Disk must be positive integers."))
         return
-    embed = create_info_embed("VPS Creation", f"Creating VPS for {user.mention} with {ram}GB RAM, {cpu} CPU cores, {disk}GB Disk.\nSelect node below.")
-    view = NodeSelectView(ram, cpu, disk, user, ctx)
+    if duration < 0:
+        await ctx.send(embed=create_error_embed("Invalid Duration", "VPS duration (in days) can't be negative. Use 0 or leave it out for no expiry."))
+        return
+    duration_text = f"\nDuration: **{duration} day(s)**, auto-suspends after that." if duration > 0 else "\nDuration: **Unlimited** (no auto-suspend)."
+    embed = create_info_embed("VPS Creation", f"Creating VPS for {user.mention} with {ram}GB RAM, {cpu} CPU cores, {disk}GB Disk.{duration_text}\nSelect node below.")
+    view = NodeSelectView(ram, cpu, disk, user, ctx, duration)
     await ctx.send(embed=embed, view=view)
 
 class ReinstallOSSelectView(discord.ui.View):
@@ -1803,7 +1848,17 @@ async def list_all_vps(ctx):
             vps_info.append(f"❓ Unknown User ({user_id}) - {len(vps_list)} VPS")
     embed = create_embed("All VPS Information", "Complete overview of all VPS deployments and user statistics", COLOR_STONE)
     add_field(embed, "System Overview", f"**Total Users:** {total_users}\n**Total VPS:** {total_vps}\n**Running:** {running_vps}\n**Stopped:** {stopped_vps}\n**Suspended:** {suspended_vps}\n**Whitelisted:** {whitelisted_vps}", False)
+    if user_summary:
+        add_field(embed, "Users", "\n".join(user_summary[:10]), False)
     await ctx.send(embed=embed)
+
+    if vps_info:
+        chunk_size = 10
+        chunks = [vps_info[i:i + chunk_size] for i in range(0, len(vps_info), chunk_size)]
+        for idx, chunk in enumerate(chunks, 1):
+            page_embed = create_embed(f"All VPS Deployments (Page {idx}/{len(chunks)})", "\n".join(chunk), COLOR_STONE)
+            page_embed.set_footer(text=f"{total_vps} VPS total | {BOT_NAME} • use {PREFIX}all-vm for a compact one-line-per-VPS view")
+            await ctx.send(embed=page_embed)
     if user_summary:
         embed = create_embed("User Summary", f"Summary of all users and their VPS", COLOR_STONE)
         summary_text = "\n".join(user_summary)
@@ -3317,6 +3372,131 @@ async def unsuspend_vps(ctx, container_name: str):
     if not found:
         await ctx.send(embed=create_error_embed("Not Found", f"VPS `{container_name}` not found."))
 
+@bot.command(name='all-vm')
+@is_admin()
+async def all_vm(ctx):
+    if not vps_data:
+        await ctx.send(embed=create_info_embed("All VPS", "No VPS have been created yet."))
+        return
+
+    rows = []
+    total_vps = 0
+    total_ram_gb = 0
+    running_count = 0
+    suspended_count = 0
+
+    for user_id, vps_list in vps_data.items():
+        for vps in vps_list:
+            total_vps += 1
+            ram_str = vps.get('ram', '0GB')
+            try:
+                total_ram_gb += int(''.join(ch for ch in ram_str if ch.isdigit()) or 0)
+            except ValueError:
+                pass
+            if vps.get('suspended', False):
+                suspended_count += 1
+                status_emoji = "🟡"
+            elif vps.get('status') == 'running':
+                running_count += 1
+                status_emoji = "🟢"
+            else:
+                status_emoji = "🔴"
+            expiry = vps.get('expires_at')
+            expiry_text = f" • expires {datetime.fromisoformat(expiry).strftime('%Y-%m-%d')}" if expiry else ""
+            rows.append(
+                f"{status_emoji} `{vps['container_name']}` — <@{user_id}> — "
+                f"**{ram_str}** RAM / {vps.get('cpu', '?')} CPU / {vps.get('storage', '?')}{expiry_text}"
+            )
+
+    unique_owners = len(vps_data)
+    summary = create_embed(
+        "🖥️ All VPS - Overview",
+        f"**Total VPS:** {total_vps}\n**Owners:** {unique_owners}\n"
+        f"**Running:** {running_count} 🟢  •  **Suspended:** {suspended_count} 🟡\n"
+        f"**Total Allocated RAM:** ~{total_ram_gb}GB"
+    )
+    await ctx.send(embed=summary)
+
+    chunk_size = 10
+    chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
+    for idx, chunk in enumerate(chunks, 1):
+        page_embed = create_embed(f"All VPS (Page {idx}/{len(chunks)})", "\n".join(chunk))
+        page_embed.set_footer(text=f"{total_vps} VPS total | {BOT_NAME}")
+        await ctx.send(embed=page_embed)
+
+@bot.command(name='extend')
+@is_admin()
+async def extend_vps(ctx, container_name: str, days: int):
+    if days <= 0:
+        await ctx.send(embed=create_error_embed("Invalid Duration", "Days must be a positive integer."))
+        return
+
+    node_id = find_node_id_for_container(container_name)
+    found = False
+    for uid, lst in vps_data.items():
+        for vps in lst:
+            if vps['container_name'] == container_name:
+                found = True
+                now = datetime.now()
+                current_expiry = None
+                if vps.get('expires_at'):
+                    try:
+                        current_expiry = datetime.fromisoformat(vps['expires_at'])
+                    except (ValueError, TypeError):
+                        current_expiry = None
+                base = current_expiry if (current_expiry and current_expiry > now) else now
+                new_expiry = base + timedelta(days=days)
+                vps['expires_at'] = new_expiry.isoformat()
+                vps['duration_days'] = (vps.get('duration_days') or 0) + days
+
+                was_suspended = vps.get('suspended', False)
+                restart_error = None
+                if was_suspended:
+                    try:
+                        vps['suspended'] = False
+                        vps['status'] = 'running'
+                        await execute_lxc(container_name, f"start {container_name}", node_id=node_id)
+                        await apply_internal_permissions(container_name, node_id)
+                        await recreate_port_forwards(container_name)
+                    except Exception as e:
+                        restart_error = str(e)
+
+                vps.setdefault('suspension_history', []).append({
+                    'time': now.isoformat(),
+                    'reason': f"Duration extended by {days} day(s) by admin" + (" (auto-unsuspended)" if was_suspended else ""),
+                    'by': f"{ctx.author.name} ({ctx.author.id})"
+                })
+                save_vps_data()
+
+                embed = create_success_embed(
+                    "VPS Duration Extended",
+                    f"VPS `{container_name}` extended by **{days} day(s)**.\n"
+                    f"New expiry: **{new_expiry.strftime('%Y-%m-%d %H:%M')}**"
+                )
+                if was_suspended and not restart_error:
+                    add_field(embed, "Status", "This VPS was suspended — it has been unsuspended and started.", False)
+                elif restart_error:
+                    add_field(embed, "Warning", f"Duration extended, but restarting the VPS failed: {restart_error}", False)
+                await ctx.send(embed=embed)
+
+                try:
+                    owner = await bot.fetch_user(int(uid))
+                    dm_text = (
+                        f"Your VPS `{container_name}` has had its duration extended by **{days} day(s)** by an admin.\n"
+                        f"**New expiry:** {new_expiry.strftime('%Y-%m-%d %H:%M')}"
+                    )
+                    if was_suspended and not restart_error:
+                        dm_text += "\n\nYour VPS was suspended and has now been **unsuspended and started**."
+                    dm = create_success_embed("🟢 VPS Duration Extended", dm_text)
+                    await owner.send(embed=dm)
+                except Exception as dm_e:
+                    logger.error(f"Failed to DM owner {uid} about extension: {dm_e}")
+                break
+        if found:
+            break
+    if not found:
+        await ctx.send(embed=create_error_embed("Not Found", f"VPS `{container_name}` not found."))
+
 @bot.command(name='suspension-logs')
 @is_admin()
 async def suspension_logs(ctx, container_name: str = None):
@@ -3387,6 +3567,137 @@ async def apply_permissions(ctx, container_name: str):
         await ctx.send(embed=create_success_embed("Permissions Applied", f"Advanced permissions applied to VPS `{container_name}`. Docker-ready with unprivileged ports!"))
     except Exception as e:
         await ctx.send(embed=create_error_embed("Apply Failed", f"Error: {str(e)}"))
+
+# ---------------------------------------------------------------------------
+# Automated background monitoring:
+#   1) Suspected crypto-mining / resource-abuse detection (sustained high
+#      CPU + RAM + Disk usage all at once gets auto-suspended).
+#   2) VPS duration expiry (VPS created with a time limit auto-suspends once
+#      that limit passes).
+# Both send a DM to the owner explaining what happened, and both can be
+# reversed by an admin (unsuspend-vps / extend).
+# ---------------------------------------------------------------------------
+@tasks.loop(minutes=MINING_CHECK_MINUTES)
+async def auto_security_monitor():
+    for user_id, vps_list in list(vps_data.items()):
+        for vps in list(vps_list):
+            container_name = vps.get('container_name')
+            if not container_name:
+                continue
+
+            # --- 1) VPS duration expiry check ---
+            expires_at = vps.get('expires_at')
+            if expires_at and not vps.get('suspended', False):
+                try:
+                    expiry_dt = datetime.fromisoformat(expires_at)
+                except (ValueError, TypeError):
+                    expiry_dt = None
+                if expiry_dt and datetime.now() >= expiry_dt:
+                    node_id = vps.get('node_id')
+                    reason = f"VPS duration expired (was valid until {expiry_dt.strftime('%Y-%m-%d %H:%M')})."
+                    try:
+                        if vps.get('status') == 'running':
+                            await execute_lxc(container_name, f"stop {container_name}", node_id=node_id)
+                        vps['status'] = 'stopped'
+                        vps['suspended'] = True
+                        vps.setdefault('suspension_history', []).append({
+                            'time': datetime.now().isoformat(),
+                            'reason': reason,
+                            'by': 'Automatic (duration expired)'
+                        })
+                        save_vps_data()
+                        logger.warning(f"Auto-suspended {container_name}: {reason}")
+                        try:
+                            owner = await bot.fetch_user(int(user_id))
+                            dm = create_warning_embed(
+                                "⏰ VPS Suspended - Duration Expired",
+                                f"Your VPS `{container_name}` has been automatically suspended because its rental duration ended.\n\n"
+                                f"**Reason:** {reason}\n\nAsk an admin to extend it with `{PREFIX}extend {container_name} <days>` to get it back."
+                            )
+                            await owner.send(embed=dm)
+                        except Exception as dm_e:
+                            logger.error(f"Failed to DM owner {user_id} about duration expiry: {dm_e}")
+                    except Exception as e:
+                        logger.error(f"Failed to auto-suspend expired VPS {container_name}: {e}")
+                    # Skip the mining check this round since it's already suspended
+                    continue
+
+            # --- 2) Suspected crypto-mining / resource-abuse check ---
+            if vps.get('status') != 'running' or vps.get('suspended', False) or vps.get('whitelisted', False):
+                _high_usage_streak.pop(container_name, None)
+                continue
+
+            try:
+                stats = await get_container_stats(container_name, vps.get('node_id'))
+                cpu = stats.get('cpu', 0.0)
+                ram_pct = stats.get('ram', {}).get('pct', 0.0)
+                disk_pct = parse_disk_percentage(stats.get('disk', ''))
+            except Exception as e:
+                logger.error(f"Failed to fetch stats for {container_name} during security monitor: {e}")
+                continue
+
+            over_all_thresholds = (
+                cpu >= MINING_CPU_THRESHOLD and
+                ram_pct >= MINING_RAM_THRESHOLD and
+                disk_pct >= MINING_DISK_THRESHOLD
+            )
+
+            if over_all_thresholds:
+                _high_usage_streak[container_name] = _high_usage_streak.get(container_name, 0) + 1
+            else:
+                _high_usage_streak[container_name] = 0
+
+            if _high_usage_streak.get(container_name, 0) >= MINING_CONSECUTIVE_CHECKS:
+                node_id = vps.get('node_id')
+                reason = (
+                    f"Suspected crypto-mining or resource-abuse: sustained CPU {cpu:.1f}%, "
+                    f"RAM {ram_pct:.1f}%, and Disk {disk_pct:.1f}% usage detected "
+                    f"over {MINING_CONSECUTIVE_CHECKS} checks in a row."
+                )
+                try:
+                    await execute_lxc(container_name, f"stop {container_name}", node_id=node_id)
+                    vps['status'] = 'stopped'
+                    vps['suspended'] = True
+                    vps.setdefault('suspension_history', []).append({
+                        'time': datetime.now().isoformat(),
+                        'reason': reason,
+                        'by': 'Automatic (suspected crypto-mining)'
+                    })
+                    save_vps_data()
+                    logger.warning(f"Auto-suspended {container_name}: {reason}")
+                    _high_usage_streak[container_name] = 0
+                    try:
+                        owner = await bot.fetch_user(int(user_id))
+                        dm = create_error_embed(
+                            "🚨 VPS Suspended - Suspicious Activity Detected",
+                            f"Your VPS `{container_name}` has been automatically suspended.\n\n"
+                            f"**Reason:** {reason}\n\n"
+                            "This pattern usually means crypto-mining or another resource-abuse "
+                            "process is running. Cryptocurrency mining is not permitted on this "
+                            "service.\n\nIf this was a legitimate workload (a build, render, or "
+                            "similar one-off task), contact an admin to explain and get your VPS "
+                            "unsuspended."
+                        )
+                        await owner.send(embed=dm)
+                    except Exception as dm_e:
+                        logger.error(f"Failed to DM owner {user_id} about auto-suspension: {dm_e}")
+                    if MAIN_ADMIN_ID:
+                        try:
+                            admin_user = await bot.fetch_user(MAIN_ADMIN_ID)
+                            admin_dm = create_warning_embed(
+                                "🚨 Auto-Suspend: Suspected Mining",
+                                f"**VPS:** `{container_name}`\n**Owner:** <@{user_id}> ({user_id})\n**Reason:** {reason}\n\n"
+                                f"Use `{PREFIX}unsuspend-vps {container_name}` if this turns out to be a false positive."
+                            )
+                            await admin_user.send(embed=admin_dm)
+                        except Exception as admin_dm_e:
+                            logger.error(f"Failed to DM main admin about auto-suspension: {admin_dm_e}")
+                except Exception as e:
+                    logger.error(f"Failed to auto-suspend suspicious VPS {container_name}: {e}")
+
+@auto_security_monitor.before_loop
+async def before_auto_security_monitor():
+    await bot.wait_until_ready()
 
 @bot.command(name='resource-check')
 @is_admin()
@@ -3586,7 +3897,9 @@ async def quick_help(ctx):
     
     if is_admin_user:
         add_field(embed, "🛡️ Admin Quick Actions", 
-            f"• `{PREFIX}create 2 2 20 @user` - Create 2GB/2CPU/20GB VPS\n"
+            f"• `{PREFIX}create 2 2 20 @user 30` - Create 2GB/2CPU/20GB VPS, auto-suspends in 30 days\n"
+            f"• `{PREFIX}all-vm` - See every VPS: owner, ID, RAM\n"
+            f"• `{PREFIX}extend <container> <days>` - Extend a VPS's duration (unsuspends it too)\n"
             f"• `{PREFIX}userinfo @user` - Check user details\n"
             f"• `{PREFIX}node list` - List all nodes\n"
             f"• `{PREFIX}serverstats` - System overview\n"
@@ -3992,7 +4305,9 @@ class HelpView(discord.ui.View):
                 "name": "🛡️ Admin Commands",
                 "commands": [
                     (f"{PREFIX}lxc-list", "List all LXC containers"),
-                    (f"{PREFIX}create <ram_gb> <cpu_cores> <disk_gb> @user", "Create VPS with OS selection"),
+                    (f"{PREFIX}create <ram_gb> <cpu_cores> <disk_gb> @user [duration_days]", "Create VPS with OS selection. Add duration_days to auto-suspend after that many days (omit for unlimited)"),
+                    (f"{PREFIX}extend <container> <days>", "Add days to a VPS's duration; auto-unsuspends it if it was suspended"),
+                    (f"{PREFIX}all-vm", "Compact list of every VPS on the bot: owner, container ID, and RAM"),
                     (f"{PREFIX}delete-vps @user <vps_number> [reason]", "Delete user's VPS"),
                     (f"{PREFIX}add-resources <container> [ram] [cpu] [disk]", "Add resources to VPS"),
                     (f"{PREFIX}resize-vps <container> [ram] [cpu] [disk]", "Resize VPS resources"),
@@ -4119,7 +4434,7 @@ class HelpView(discord.ui.View):
             "ports": "Tip: Port forwards work for both TCP and UDP protocols.",
             "system": "Tip: Set thresholds to monitor resource usage across nodes.",
             "nodes": f"Tip: Use `{PREFIX}node list` to see all available nodes and their status.",
-            "admin": f"Tip: Always check `{PREFIX}userinfo @user` before modifying VPS.",
+            "admin": f"Tip: Always check `{PREFIX}userinfo @user` before modifying VPS. Sustained high CPU+RAM+Disk is auto-flagged as possible crypto-mining and auto-suspended — check `{PREFIX}suspension-logs <container>` to see why, and `{PREFIX}unsuspend-vps` or `{PREFIX}extend` to lift it.",
             "main_admin": "Tip: Be careful when adding/removing admin privileges."
         }
        
